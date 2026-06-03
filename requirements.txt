@@ -1,0 +1,4 @@
+surya-ocr
+pymupdf
+beautifulsoup4
+pillow

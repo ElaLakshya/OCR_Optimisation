@@ -1,0 +1,49 @@
+# Virtual environment
+venv/
+env/
+ENV/
+
+# llama.cpp binaries and downloads
+llama_cpp/
+*.zip
+
+# Input files (keep personal documents off git)
+*.jpeg
+*.jpg
+*.png
+*.pdf
+
+# OCR output files
+*_ocr.txt
+*_ocr.html
+output.txt
+output.html
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Environment files
+.env
+.env.local
+local.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Hugging Face model cache (if stored locally in project)
+.cache/
+models/
