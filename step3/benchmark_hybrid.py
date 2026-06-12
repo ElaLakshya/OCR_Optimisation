@@ -4,10 +4,12 @@ benchmark_hybrid.py
 Benchmarks the hybrid pipeline against the full Surya baseline.
 
 Hybrid pipeline:
-    Stage 1 — Text Line Detection    : Surya DetectionPredictor  (unchanged)
-    Stage 2 — Layout Analysis        : PP-DocLayoutV3 ONNX       (SWAPPED)
-    Stage 3 — Table Recognition      : Surya TableRecPredictor   (unchanged)
-    Stage 4 — OCR Recognition        : Surya RecognitionPredictor(unchanged)
+    Stage 1 — Model Loading          : Surya models (baseline) / PP-DocLayoutV3 ONNX (hybrid)
+    Stage 2 — Text Line Detection    : Surya DetectionPredictor  (unchanged)
+    Stage 3 — Layout Analysis        : PP-DocLayoutV3 ONNX       (SWAPPED)
+    Stage 4 — Table Recognition      : Surya TableRecPredictor   (unchanged)
+    Stage 5 — JSON Write             : same logic as individual.py
+    Stage 6 — OCR Recognition        : Surya RecognitionPredictor(unchanged)
 
 Run from Surya venv:
     python benchmark_hybrid.py
@@ -30,9 +32,10 @@ from pp_layout_backend import PPLayoutPredictor
 sys.stdout.reconfigure(encoding='utf-8')
 
 # ─────────────────────────────────────────────
-INPUT_PDF = "input1.pdf"
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+INPUT_PDF = "Pumplet01.jpg"
 DPI       = 150
-PP_MODEL  = "./models/PP-DocLayoutV3.onnx"
+PP_MODEL = os.path.join(os.getcwd(), "models", "PP-DocLayoutV3.onnx")
 # ─────────────────────────────────────────────
 
 def pdf_to_images(pdf_path, dpi=150):
@@ -81,8 +84,46 @@ def block_to_text(block):
             br.replace_with("\n")
         return soup.get_text(strip=True)
 
+def write_json(det_results, lay_results, tab_results, tab_page_map, images, output_path):
+    json_output = []
+    for page_idx, (det, lay) in enumerate(zip(det_results, lay_results)):
+        page_data = {
+            "page": page_idx + 1,
+            "text_lines": [
+                {
+                    "bbox": line.bbox,
+                    "confidence": getattr(line, "confidence", None),
+                }
+                for line in det.bboxes
+            ],
+            "layout_blocks": [
+                {
+                    "bbox": block.bbox,
+                    "label": block.label,
+                    "reading_order": getattr(block, "reading_order", None),
+                }
+                for block in lay.bboxes
+            ],
+            "tables": []
+        }
+        json_output.append(page_data)
+    for table_idx, (tab_res, page_idx) in enumerate(zip(tab_results, tab_page_map)):
+        json_output[page_idx]["tables"].append({
+            "table_index": table_idx,
+            "cells": [
+                {
+                    "bbox": cell.bbox,
+                    "text": getattr(cell, "text", ""),
+                    "row": getattr(cell, "row_id", None),
+                    "col": getattr(cell, "col_id", None),
+                }
+                for cell in getattr(tab_res, "cells", [])
+            ]
+        })
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(json_output, f, ensure_ascii=False, indent=2)
+
 def run_table_rec(tab_predictor, images, lay_results):
-    """Crop table regions from layout and run table recognition."""
     table_images = []
     table_page_map = []
     for page_idx, (img, lay) in enumerate(zip(images, lay_results)):
@@ -100,55 +141,67 @@ if not os.path.isfile(INPUT_PDF):
     print(f"ERROR: File not found — {INPUT_PDF}")
     sys.exit(1)
 
-print("Converting PDF to images...")
-images = pdf_to_images(INPUT_PDF, dpi=DPI)
-print(f"Found {len(images)} page(s)\n")
+base_name = os.path.splitext(INPUT_PDF)[0]
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  RUN 1 — SURYA BASELINE (all stages)
+#  RUN 1 — SURYA BASELINE (all 6 stages)
 # ══════════════════════════════════════════════════════════════════════════════
 print("=" * 60)
 print("  RUN 1 — SURYA BASELINE")
 print("=" * 60)
 
-print("  Loading models...")
+# Stage 1 — Model Loading
+print("  [1/6] Model Loading...")
 t0 = time.time()
-det_predictor  = DetectionPredictor()
-lay_predictor  = LayoutPredictor()
-rec_predictor  = RecognitionPredictor()
-tab_predictor  = TableRecPredictor()
+det_predictor = DetectionPredictor()
+lay_predictor = LayoutPredictor()
+rec_predictor = RecognitionPredictor()
+tab_predictor = TableRecPredictor()
+images = pdf_to_images(INPUT_PDF, dpi=DPI)
 base_load_time = time.time() - t0
-print(f"  Models loaded in {base_load_time:.2f}s\n")
+print(f"        {base_load_time:.2f}s  ({len(images)} page(s) loaded)\n")
 
-print("  [1/4] Text Line Detection...")
+# Stage 2 — Text Line Detection
+print("  [2/6] Text Line Detection...")
 t0 = time.time()
 det_results = det_predictor(images)
 base_det_time = time.time() - t0
 print(f"        {base_det_time:.2f}s\n")
 
-print("  [2/4] Layout Analysis (Surya)...")
+# Stage 3 — Layout Analysis
+print("  [3/6] Layout Analysis (Surya)...")
 t0 = time.time()
 base_lay_results = lay_predictor(images)
 base_lay_time = time.time() - t0
 print(f"        {base_lay_time:.2f}s  ({sum(len(r.bboxes) for r in base_lay_results)} blocks)\n")
 
-print("  [3/4] Table Recognition...")
+# Stage 4 — Table Recognition
+print("  [4/6] Table Recognition...")
 t0 = time.time()
 base_tab_results, base_tab_map, base_n_tables = run_table_rec(tab_predictor, images, base_lay_results)
 base_tab_time = time.time() - t0
 print(f"        {base_tab_time:.2f}s  ({base_n_tables} table(s))\n")
 
-print("  [4/4] OCR Recognition...")
+# Stage 5 — JSON Write
+print("  [5/6] JSON Write...")
+t0 = time.time()
+write_json(det_results, base_lay_results, base_tab_results, base_tab_map, images,
+           base_name + "_baseline_structure.json")
+base_json_time = time.time() - t0
+print(f"        {base_json_time:.2f}s\n")
+
+# Stage 6 — OCR Recognition
+print("  [6/6] OCR Recognition...")
 t0 = time.time()
 base_rec_results = rec_predictor(images, base_lay_results)
 base_rec_time = time.time() - t0
 print(f"        {base_rec_time:.2f}s\n")
 
-base_total = base_det_time + base_lay_time + base_tab_time + base_rec_time
+base_total = base_load_time + base_det_time + base_lay_time + base_tab_time + base_json_time + base_rec_time
 
 # Save baseline OCR output
-base_name = os.path.splitext(INPUT_PDF)[0]
 with open(base_name + "_baseline_ocr.txt", "w", encoding="utf-8") as f:
     for page_num, page in enumerate(base_rec_results):
         f.write(f"{'='*60}\n  Page {page_num + 1}\n{'='*60}\n\n")
@@ -159,46 +212,57 @@ with open(base_name + "_baseline_ocr.txt", "w", encoding="utf-8") as f:
                     f.write(text + "\n\n")
 print(f"  Baseline OCR saved to: {base_name}_baseline_ocr.txt\n")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  RUN 2 — HYBRID PIPELINE (PP-DocLayoutV3 layout swap)
+#  RUN 2 — HYBRID PIPELINE (all 6 stages)
 # ══════════════════════════════════════════════════════════════════════════════
 print("=" * 60)
 print("  RUN 2 — HYBRID (PP-DocLayoutV3 layout swap)")
 print("=" * 60)
 
-print("  Loading PP-DocLayoutV3 ONNX...")
+# Stage 1 — Model Loading (PP-DocLayoutV3 only; other models reused from baseline)
+print("  [1/6] Model Loading (PP-DocLayoutV3 ONNX)...")
 t0 = time.time()
 pp_predictor = PPLayoutPredictor(PP_MODEL)
-pp_load_time = time.time() - t0
-print(f"  Loaded in {pp_load_time:.2f}s\n")
+# Force load now so timing is accurate
+pp_predictor._load()
+hybrid_load_time = time.time() - t0
+print(f"        {hybrid_load_time:.2f}s\n")
 
-print("  [1/4] Text Line Detection (reusing baseline results)...")
+# Stage 2 — Text Line Detection (reuse baseline results, same predictor)
+print("  [2/6] Text Line Detection (reusing baseline results)...")
 print(f"        {base_det_time:.2f}s  (same as baseline)\n")
+hybrid_det_time = base_det_time
 
-print("  [2/4] Layout Analysis (PP-DocLayoutV3)...")
+# Stage 3 — Layout Analysis (PP-DocLayoutV3)
+print("  [3/6] Layout Analysis (PP-DocLayoutV3)...")
 t0 = time.time()
 hybrid_lay_results = pp_predictor(images)
-for r in hybrid_lay_results:
-    for box in r.bboxes:
-        if box.label == "Table":
-            print(f"[DEBUG] Table block: label={box.label!r} raw_label={box.raw_label!r} bbox={box.bbox}")
 hybrid_lay_time = time.time() - t0
 print(f"        {hybrid_lay_time:.2f}s  ({sum(len(r.bboxes) for r in hybrid_lay_results)} blocks)\n")
 
-print("  [3/4] Table Recognition...")
+# Stage 4 — Table Recognition
+print("  [4/6] Table Recognition...")
 t0 = time.time()
 hybrid_tab_results, hybrid_tab_map, hybrid_n_tables = run_table_rec(tab_predictor, images, hybrid_lay_results)
 hybrid_tab_time = time.time() - t0
 print(f"        {hybrid_tab_time:.2f}s  ({hybrid_n_tables} table(s))\n")
 
-print("  [4/4] OCR Recognition...")
+# Stage 5 — JSON Write
+print("  [5/6] JSON Write...")
+t0 = time.time()
+write_json(det_results, hybrid_lay_results, hybrid_tab_results, hybrid_tab_map, images,
+           base_name + "_hybrid_structure.json")
+hybrid_json_time = time.time() - t0
+print(f"        {hybrid_json_time:.2f}s\n")
+
+# Stage 6 — OCR Recognition
+print("  [6/6] OCR Recognition...")
 t0 = time.time()
 hybrid_rec_results = rec_predictor(images, hybrid_lay_results)
 hybrid_rec_time = time.time() - t0
 print(f"        {hybrid_rec_time:.2f}s\n")
 
-hybrid_total = base_det_time + hybrid_lay_time + hybrid_tab_time + hybrid_rec_time
+hybrid_total = hybrid_load_time + hybrid_det_time + hybrid_lay_time + hybrid_tab_time + hybrid_json_time + hybrid_rec_time
 
 # Save hybrid OCR output
 with open(base_name + "_hybrid_ocr.txt", "w", encoding="utf-8") as f:
@@ -223,12 +287,14 @@ print("  COMPARISON SUMMARY")
 print("=" * 60)
 print(f"  {'Stage':<30} {'Baseline':>10} {'Hybrid':>10} {'Saved':>10}")
 print(f"  {'-'*60}")
-print(f"  {'Text Line Detection':<30} {base_det_time:>9.2f}s {base_det_time:>9.2f}s {'—':>9}")
+print(f"  {'Model Loading':<30} {base_load_time:>9.2f}s {hybrid_load_time:>9.2f}s {base_load_time - hybrid_load_time:>8.2f}s")
+print(f"  {'Text Line Detection':<30} {base_det_time:>9.2f}s {hybrid_det_time:>9.2f}s {'—':>9}")
 print(f"  {'Layout Analysis':<30} {base_lay_time:>9.2f}s {hybrid_lay_time:>9.2f}s {base_lay_time - hybrid_lay_time:>8.2f}s")
 print(f"  {'Table Recognition':<30} {base_tab_time:>9.2f}s {hybrid_tab_time:>9.2f}s {base_tab_time - hybrid_tab_time:>8.2f}s")
+print(f"  {'JSON Write':<30} {base_json_time:>9.2f}s {hybrid_json_time:>9.2f}s {'—':>9}")
 print(f"  {'OCR Recognition':<30} {base_rec_time:>9.2f}s {hybrid_rec_time:>9.2f}s {'—':>9}")
 print(f"  {'-'*60}")
-print(f"  {'TOTAL (excl. loading)':<30} {base_total:>9.2f}s {hybrid_total:>9.2f}s {saved:>8.2f}s")
+print(f"  {'TOTAL':<30} {base_total:>9.2f}s {hybrid_total:>9.2f}s {saved:>8.2f}s")
 print(f"  {'Improvement':<30} {'':>10} {'':>10} {pct_saved:>8.1f}%")
 print("=" * 60)
 print(f"\n  Layout speedup : {base_lay_time / hybrid_lay_time:.1f}x faster")
@@ -249,9 +315,11 @@ with open(timing_path, "w", encoding="utf-8") as f:
     f.write("=" * 60 + "\n")
     f.write(f"  {'Stage':<30} {'Baseline':>10} {'Hybrid':>10} {'Saved':>10}\n")
     f.write(f"  {'-'*60}\n")
-    f.write(f"  {'Text Line Detection':<30} {base_det_time:>9.2f}s {base_det_time:>9.2f}s {'—':>9}\n")
+    f.write(f"  {'Model Loading':<30} {base_load_time:>9.2f}s {hybrid_load_time:>9.2f}s {base_load_time - hybrid_load_time:>8.2f}s\n")
+    f.write(f"  {'Text Line Detection':<30} {base_det_time:>9.2f}s {hybrid_det_time:>9.2f}s {'—':>9}\n")
     f.write(f"  {'Layout Analysis':<30} {base_lay_time:>9.2f}s {hybrid_lay_time:>9.2f}s {base_lay_time - hybrid_lay_time:>8.2f}s\n")
     f.write(f"  {'Table Recognition':<30} {base_tab_time:>9.2f}s {hybrid_tab_time:>9.2f}s {base_tab_time - hybrid_tab_time:>8.2f}s\n")
+    f.write(f"  {'JSON Write':<30} {base_json_time:>9.2f}s {hybrid_json_time:>9.2f}s {'—':>9}\n")
     f.write(f"  {'OCR Recognition':<30} {base_rec_time:>9.2f}s {hybrid_rec_time:>9.2f}s {'—':>9}\n")
     f.write(f"  {'-'*60}\n")
     f.write(f"  {'TOTAL':<30} {base_total:>9.2f}s {hybrid_total:>9.2f}s {saved:>8.2f}s\n")

@@ -73,3 +73,5 @@ webapp/backend/outputs/
 webapp/backend/input*.pdf
 webapp/backend/input*.png
 webapp/backend/input*.jpg
+
+webapp/backend/venv_webapp/

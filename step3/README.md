@@ -1,155 +1,118 @@
-# Step 3 — Layout Analysis Pipeline Swap (Surya → PP-DocLayoutV3 ONNX)
+# Step 3 — Layout Analysis Pipeline Swap + Hybrid Web App
 
 ## Overview
 
-Step 2 showed that Layout Analysis consumed ~41% of total pipeline runtime (65s out of 160s), entirely due to Surya's VLM-backed layout model. Step 3 replaces that single stage with a fast CNN-based alternative — **PP-DocLayoutV3 ONNX** — while keeping every other Surya stage intact.
+Step 3 has two parts:
 
-This is a surgical swap: the overall pipeline architecture is unchanged. Only the layout predictor is replaced.
+1. **Layout Analysis Swap** — Surya's slow VLM-based layout model is replaced with PP-DocLayoutV3 ONNX (a fast CNN), achieving a 24x speedup on layout analysis and 41.6% total pipeline improvement.
 
----
-
-## Why Layout Analysis Was Targeted
-
-| Stage | Time | Replaceable? |
-|---|---|---|
-| Text Line Detection | 4s | Not needed — already fast |
-| Layout Analysis | 65s | ✅ Yes — pure detection task, no language understanding needed |
-| Table Recognition | 10s | Potential future target |
-| OCR Recognition | 80s | ❌ Hard constraint — Surya's VLM kept intentionally |
-
-OCR Recognition was deliberately left unchanged. The goal of this project is to preserve Surya's OCR accuracy while reducing total pipeline time. Replacing the OCR model would risk accuracy loss, especially on mixed Hindi/English documents.
-
-Layout analysis, by contrast, is a purely geometric task — it finds and labels rectangular regions on a page. It has no dependency on language, script, or text content. This makes it safe to swap independently.
+2. **Hybrid Web Application** — A FastAPI + React web app that combines Docling (for digital text extraction) with the optimised Surya OCR pipeline (for image regions and garbled text).
 
 ---
 
-## Why PP-DocLayoutV3 ONNX
+## Part 1 — Layout Analysis Swap
+
+### Why Layout Was Targeted
+
+From the Step 2 benchmark, Layout Analysis consumed 65s (41% of total runtime) using Surya's VLM backend. It was the largest replaceable bottleneck — layout detection is a purely geometric task with no language dependency, making it safe to swap independently.
+
+### PP-DocLayoutV3 ONNX
 
 - Pure CNN object detector (RT-DETR architecture) — no VLM, no llama.cpp
-- Pre-converted ONNX model available: `alex-dinh/PP-DocLayoutV3-ONNX` on HuggingFace
-- No PaddleX or Paddle framework dependency — runs on pure `onnxruntime + numpy + opencv`
-- 23 layout categories that map cleanly onto Surya's label schema
-- Runs entirely on CPU — compatible with the Intel Iris Xe hardware constraint
+- Pre-converted ONNX — runs on pure `onnxruntime + numpy + opencv`
+- 23 layout categories mapping to Surya's label schema
+- Runs on CPU — compatible with Intel Iris Xe hardware
 
----
+### Table Misclassification Fix
 
-## How the Swap Works
-
-Surya's `RecognitionPredictor` accepts a `layout_results` parameter — a list of `LayoutResult` objects, one per page. By building a drop-in predictor that produces `LayoutResult` objects matching Surya's exact schema, we can substitute the layout stage without touching any other part of the pipeline.
-
-```
-BEFORE:  DetectionPredictor → LayoutPredictor (VLM) → TableRecPredictor → RecognitionPredictor
-AFTER:   DetectionPredictor → PPLayoutPredictor (ONNX CNN) → TableRecPredictor → RecognitionPredictor
-```
-
-`pp_layout_backend.py` implements `PPLayoutPredictor` as a drop-in replacement. It imports and constructs Surya's real `LayoutBox` and `LayoutResult` Pydantic models directly from `surya.layout.schema`, ensuring full schema compatibility with downstream stages.
-
----
-
-## Label Mapping
-
-PP-DocLayoutV3 uses its own 23-category label set. These are mapped to Surya's canonical labels:
+PP-DocLayoutV3 misclassified wide ruled tables as `image` on the CBSE marksheet. Fixed with a geometric heuristic:
 
 ```python
-LABEL_MAP = {
-    "text":             "Text",
-    "paragraph_title":  "SectionHeader",
-    "document_title":   "SectionHeader",
-    "table":            "Table",
-    "figure":           "Picture",
-    "image":            "Picture",
-    "figure_caption":   "Caption",
-    "table_caption":    "Caption",
-    "footnotes":        "Footnote",
-    "header":           "PageHeader",
-    "footer":           "PageFooter",
-    "formula":          "Equation",
-    "algorithm":        "Code",
-    ...
-}
-```
-
----
-
-## Table Detection Problem and Fix
-
-### The Problem
-
-During testing on a CBSE marksheet (`input1.pdf`), PP-DocLayoutV3 misclassified the marks table as `raw_label='image'` (mapped to `Picture`). This is a known limitation of models trained primarily on academic papers — a dense ruled table rendered from PDF at 150 DPI can visually resemble a structured graphic.
-
-This was a critical bug: blocks labelled `Picture` are passed to Surya's recognition stage as images to skip, so the entire table content would have been lost.
-
-### How It Was Identified
-
-A debug print of `raw_label` was added to the test script to inspect what PP-DocLayoutV3 actually assigned to each block before label mapping:
-
-```
-[Picture] raw='image' conf=0.97 bbox=[39.5, 621.3, 1196.8, 864.1]
-```
-
-The block spanning nearly the full page width with 97% confidence was being called `image`.
-
-### The Fix — Geometric Heuristic
-
-Since layout analysis is purely geometric, a three-signal heuristic was used to distinguish wide ruled tables from actual images:
-
-```python
-def _looks_like_table(det, orig_w, orig_h):
-    w = x1 - x0
-    h = y1 - y0
-    aspect     = w / h          # tables are wide and shallow
-    width_frac = w / orig_w     # tables span most of page width
-    area_frac  = (w * h) / (orig_w * orig_h)
-
+def _looks_like_table(x0, y0, x1, y1, orig_w, orig_h):
+    aspect     = (x1-x0) / (y1-y0)
+    width_frac = (x1-x0) / orig_w
+    area_frac  = ((x1-x0) * (y1-y0)) / (orig_w * orig_h)
     return aspect > 2.5 and width_frac > 0.7 and area_frac > 0.08
 ```
 
-This is applied only to blocks where `raw_label in ("image", "figure")` — it never affects blocks the model already labelled correctly. A real photograph rarely spans 70%+ of page width and has an aspect ratio above 2.5 simultaneously.
+### Token Budget Fix
+
+Surya's `RecognitionPredictor` uses `box.count` for token budgeting. PP-DocLayoutV3 doesn't produce this value so we estimate it geometrically, with Table blocks always getting `count=900` → `max_tokens=1000`.
+
+### Results
+
+| Stage | Surya Baseline | Hybrid | Saved |
+|---|---|---|---|
+| Layout Analysis | 65.14s | 2.72s | 62.42s |
+| Total Pipeline | 160.60s | 93.71s | 66.89s |
+| Improvement | — | — | **41.6%** |
 
 ---
 
-## Token Budget Fix
+## Part 2 — Hybrid Web Application
 
-Surya's `RecognitionPredictor` uses `box.count` to calculate a token budget for each block:
+### Architecture
 
-```python
-max_tokens = image_token_budget(box.count, ceiling=2048)
-# count=0   → max_tokens=100
-# count=50  → max_tokens=150
-# count=300 → max_tokens=400
-# count=900 → max_tokens=1000
+```
+PDF uploaded
+    │
+    ▼
+Docling (do_ocr=False)
+    ├── Clean digital text → extracted directly
+    ├── Garbled text (custom font encoding) → crop → Surya OCR
+    ├── Pictures → SHA-256 cache → PP-DocLayoutV3 → Skip/Table/OCR
+    └── Tables → Docling native HTML
+                 → if garbled headers → Surya TableRecPredictor
+                 → if empty → RapidTable fallback
+    │
+    ▼
+Merge all blocks by position → render HTML → convert to PDF (wkhtmltopdf)
+
+Image uploaded (JPG/PNG)
+    │
+    ▼
+PP-DocLayoutV3 layout → Surya OCR + RapidTable → render HTML → PDF
 ```
 
-PP-DocLayoutV3 does not produce a token estimate. An initial hardcoded `count=1` caused the marks table to be truncated after the header row (only 101 tokens available).
+### SHA-256 Image Cache
 
-The fix uses a geometric area estimate, with a hard override for Table blocks:
+Every image region is hashed before classification. Identical images (e.g. a logo on every page) are processed once and cached — subsequent pages get the result instantly.
+
+Two-layer cache:
+- **Layer 1** — in-memory dict (microseconds)
+- **Layer 2** — SQLite on disk (persists across runs)
+
+### Garbled Hindi Detection
+
+PDFs with custom font encoding store Hindi as ASCII lookalikes. Detection uses word-level analysis:
 
 ```python
-def _estimate_count(x0, y0, x1, y1, page_w, page_h):
-    area_frac = ((x1 - x0) * (y1 - y0)) / (page_w * page_h)
-    if area_frac < 0.05:   return 50
-    elif area_frac < 0.15: return 300
-    elif area_frac < 0.30: return 600
-    else:                  return 900
+_GARBLED_CHARS = set(";\\/æøåÆØÅçèéêëìíîïðñòóôõöùúûüýþÿ'{}")
 
-# Table blocks always get maximum budget
-if det["label"] == "Table":
-    count = 900
+def _word_is_garbled(word):
+    if any(c in _GARBLED_CHARS for c in word):
+        return True
+    # Unpronounceable consonant cluster
+    if re.search(r'[bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ]{4,}', word):
+        return True
+    return False
 ```
 
----
+If >10% of words in a block are garbled, the block is cropped and sent to Surya OCR.
 
-## Results
+### Stack
 
-| Metric | Surya Baseline | Hybrid |
-|---|---|---|
-| Layout Analysis | 65.14s | 2.72s |
-| Layout Speedup | — | **24x faster** |
-| Total Pipeline | 160.60s | 93.71s |
-| Total Improvement | — | **41.6% faster** |
-| OCR Output Quality | Reference | Equivalent |
-
-The marks table, all subject scores, personal details, and result legend are all present and correct in the hybrid output.
+| Component | Technology |
+|---|---|
+| Backend | FastAPI + Python |
+| Frontend | React (create-react-app) |
+| Digital text extraction | Docling 2.98.0 |
+| Layout classification | PP-DocLayoutV3 ONNX |
+| OCR | Surya RecognitionPredictor (VLM via llama-server) |
+| Table recognition (PDF) | Surya TableRecPredictor |
+| Table recognition (images) | RapidTable (SLANet ONNX) |
+| PDF output | wkhtmltopdf via pdfkit |
+| Image cache | Python dict + SQLite |
 
 ---
 
@@ -157,44 +120,61 @@ The marks table, all subject scores, personal details, and result legend are all
 
 | File | Purpose |
 |---|---|
-| `pp_layout_backend.py` | Drop-in `PPLayoutPredictor` — the layout swap implementation |
-| `test_ppdoclayout.py` | Standalone test: compares PP-DocLayoutV3 vs Surya layout side by side |
-| `benchmark_hybrid.py` | Full pipeline benchmark: runs Surya baseline then hybrid, saves timing + OCR output for both |
-
-### What `benchmark_hybrid.py` produces
-
-- Console comparison table (per-stage timings for both pipelines)
-- `input1_baseline_ocr.txt` — OCR output from full Surya pipeline
-- `input1_hybrid_ocr.txt` — OCR output from hybrid pipeline
-- `input1_hybrid_timing.txt` — timing log saved to disk
+| `pp_layout_backend.py` | PP-DocLayoutV3 drop-in for Surya's LayoutPredictor |
+| `test_ppdoclayout.py` | Layout comparison test (PP-DocLayout vs Surya) |
+| `benchmark_hybrid.py` | Full pipeline benchmark — baseline vs hybrid |
+| `webapp/backend/main.py` | FastAPI app — upload, status, result, download endpoints |
+| `webapp/backend/pipeline.py` | Main OCR pipeline orchestrator |
+| `webapp/backend/image_cache.py` | SHA-256 image cache (memory + SQLite) |
+| `webapp/backend/layout.py` | PP-DocLayoutV3 single-image classifier |
+| `webapp/backend/table_rec.py` | RapidTable wrapper (swappable) |
+| `webapp/frontend/src/App.js` | React UI — upload, progress, output display |
 
 ---
 
 ## How to Run
 
-```bash
-# Test layout detection only
-python test_ppdoclayout.py
-
-# Full hybrid vs baseline benchmark
-python benchmark_hybrid.py
+### Backend
+```powershell
+cd webapp\backend
+.\venv_webapp\Scripts\Activate.ps1
+uvicorn main:app --reload --port 8000
 ```
 
-Requires the PP-DocLayoutV3 ONNX model at `./models/PP-DocLayoutV3.onnx`. Download with:
-
-```bash
-python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='alex-dinh/PP-DocLayoutV3-ONNX', filename='PP-DocLayoutV3.onnx', local_dir='./models')"
+### Frontend
+```powershell
+cd webapp\frontend
+npm start
 ```
 
----
+Open `http://localhost:3000`
 
-## Requirements
-
+### Requirements (webapp venv)
 ```
+fastapi
+uvicorn
+python-multipart
+docling
 onnxruntime
 opencv-python
 numpy
-huggingface_hub
+Pillow
+beautifulsoup4
+pymupdf
+rapid-table
+pdfkit
+surya-ocr (local source install)
 ```
 
-All other dependencies are inherited from the Surya virtual environment.
+### External dependencies
+- **wkhtmltopdf** — for PDF generation. Install from https://wkhtmltopdf.org/downloads.html
+- **PP-DocLayoutV3.onnx** — download from `alex-dinh/PP-DocLayoutV3-ONNX` on HuggingFace, place at `Surya_OCR/surya/models/PP-DocLayoutV3.onnx`
+- **llama-server.exe** — Vulkan build, place at `Surya_OCR/surya/llama_cpp/llama-server.exe`
+
+---
+
+## Known Limitations
+
+- PDFs with custom Hindi font encoding will have garbled table column headers. Body text and standalone Hindi paragraphs are correctly routed to Surya OCR. This is a PDF encoding issue — the font glyph mapping is private and cannot be reversed without the original font file.
+- PDF output requires wkhtmltopdf installed separately on Windows.
+- First request after server start is slower — Surya models load on startup (~30s).
