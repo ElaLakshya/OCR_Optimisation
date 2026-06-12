@@ -52,3 +52,24 @@ benchmark_results.*
 *_timing.txt
 *_structure.json
 *_hybrid_timing.txt
+
+# Debug files
+debug_ocr_region_*.png
+
+# Cache databases
+*.db
+
+# Font files
+*.ttf
+
+# Installer binaries
+*.exe
+*.zip
+*.msvc*
+
+# Input/output files in webapp
+webapp/backend/uploads/
+webapp/backend/outputs/
+webapp/backend/input*.pdf
+webapp/backend/input*.png
+webapp/backend/input*.jpg
