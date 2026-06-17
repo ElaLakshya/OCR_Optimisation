@@ -50,24 +50,25 @@ Surya processes a document through up to 5 sequential deep-learning pipelines. T
 │   ├── individual.py                Times each Surya stage separately
 │   └── README.md
 │
-├── step3/                           ← Layout swap + hybrid pipeline
+├── step3/                           ← Layout swap + hybrid pipeline + BitNet AI
 │   ├── pp_layout_backend.py         PP-DocLayoutV3 drop-in for Surya layout
 │   ├── benchmark_hybrid.py          Baseline vs hybrid benchmark
 │   ├── test_ppdoclayout.py          Layout comparison test
 │   ├── SLANet_accuracy.py           SLANet table recognition evaluation
+│   ├── requirements.txt
 │   └── README.md
 │
 └── webapp/                          ← Web application (FastAPI + React)
     ├── README.md
     ├── backend/
-    │   ├── main.py                  FastAPI app
+    │   ├── main.py                  FastAPI app (OCR + BitNet LLM integration)
     │   ├── pipeline.py              OCR pipeline orchestrator
-    │   ├── image_cache.py           SHA-256 image cache (memory + SQLite)
+    │   ├── image_cache.py           dHash (perceptual) image cache
     │   ├── layout.py                PP-DocLayoutV3 classifier
     │   └── table_rec.py             RapidTable wrapper
     └── frontend/
         └── src/
-            └── App.js               React UI
+            └── App.js               React UI with LLM action buttons
 ```
 
 ---
@@ -107,14 +108,16 @@ Replaces Surya's VLM-based Layout Analysis with **PP-DocLayoutV3 ONNX** (a fast 
 
 Key fixes: table misclassification heuristic, token budget estimation, Pydantic schema compatibility.
 
-### Step 4 — Web Application
+### Step 4 — Web Application & AI Document Intelligence
 **Folder:** `webapp/`
 
-A FastAPI + React web app combining:
+A FastAPI + React web app combining document extraction with local generative AI:
+
 - **Docling** for fast digital text extraction from PDFs
 - **PP-DocLayoutV3** for image region classification
 - **Surya OCR** for garbled Hindi text and image regions
-- **SHA-256 image cache** to skip duplicate regions (logos, seals)
+- **dHash (Difference Hash) Cache** to perceptually skip duplicate image regions (logos, seals)
+- **Local BitNet 1.58b LLM** integrated natively via C++ subprocess to classify documents and generate strict, structured summaries completely offline
 - **wkhtmltopdf** for PDF output
 
 Supports PDF and image (JPG/PNG) input. Output as HTML and PDF.
@@ -128,7 +131,7 @@ All benchmarks and development on:
 - RAM: 16GB
 - GPU: Intel Iris Xe (integrated, no CUDA)
 - OS: Windows 11
-- Inference: llama.cpp Vulkan build
+- Inference: llama.cpp Vulkan build / Native C++ CPU Inference
 
 ---
 
@@ -151,7 +154,7 @@ Open `http://localhost:3000` — see `webapp/README.md` for full setup instructi
 
 ## Setup
 
-See `step1/README.md` for Surya installation. See `webapp/README.md` for webapp setup including wkhtmltopdf and model downloads.
+See `step1/README.md` for Surya installation. See `webapp/README.md` for webapp setup including wkhtmltopdf and model downloads. See `step3/README.md` for the BitNet build process.
 
 ---
 
@@ -160,4 +163,5 @@ See `step1/README.md` for Surya installation. See `webapp/README.md` for webapp 
 - OCR engine: [Surya](https://github.com/VikParuchuri/surya) by Vik Paruchuri — licensed under GPL-3.0
 - Layout model: [PP-DocLayoutV3](https://huggingface.co/alex-dinh/PP-DocLayoutV3-ONNX) — ONNX export by alex-dinh
 - Digital extraction: [Docling](https://github.com/docling-project/docling) by IBM
-- Inference backend: [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- Inference backends: [llama.cpp](https://github.com/ggml-org/llama.cpp) & Microsoft Visual Studio 2022 (MSVC)
+- LLM Foundation: [BitNet b1.58 2B](https://github.com/microsoft/BitNet) by Microsoft
