@@ -323,7 +323,14 @@ DOCUMENT TEXT:
         print("[BitNet] Unknown error:\n", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── BitNet: FIR Classification ───────────────────────────────────────────────
+# ── BitNet: Document Type + Investigation Status Classification ──────────────
+# NOTE: "Not an FIR" is a document-type check (is this even a police case
+# document at all). "Suspect Identified" / "Case Open" report investigation
+# status for documents that ARE FIRs — NOT a judgment on whether the
+# underlying complaint is legitimate. An "open/untraced" result is a normal,
+# common outcome for genuine crimes and does not mean the FIR was fake,
+# rejected, or without merit — it only reflects whether the document
+# currently shows a named suspect tied to supporting evidence.
 @app.post("/classify/{job_id}")
 def classify_document(job_id: str):
     with _jobs_lock:
@@ -335,34 +342,42 @@ def classify_document(job_id: str):
     try:
         clean_text = _get_clean_document_text(job)
 
-        prompt = f"""You are a helpful assistant that classifies the text into exactly one of these three categories: "Valid FIR", "Invalid FIR", or "Not an FIR". Respond with only the category name and nothing else.
+        prompt = f"""You are a helpful assistant reviewing a document. First check whether this document is a police FIR / case diary at all. Then, only if it is, determine the current investigation status based only on what is stated in the text.
+
+Respond with exactly one of these three labels, followed by a one-sentence reason:
+- "Not an FIR" — the document is not a police FIR or case diary (e.g. it is an unrelated letter, certificate, invoice, or other document type).
+- "Suspect Identified" — the document is an FIR, a specific named individual is identified as a suspect, AND there is stated evidence connecting them to the offense (e.g. confession, forensic match, recovered stolen property, witness identification).
+- "Case Open" — the document is an FIR, but no named suspect is tied to supporting evidence (this includes: no suspect found, suspects were questioned but not linked by evidence, or the case is recorded as untraced/pending).
+
+Do not judge whether the complaint itself is genuine or whether it should be filed — only report the document type, and if it is an FIR, what it states about suspect identification and evidence.
 
 DOCUMENT TEXT:
 {clean_text}
-CLASSIFICATION:"""
 
-        output = _run_bitnet(job_id, prompt, n_tokens=20)
+STATUS:"""
 
-        if "CLASSIFICATION:" in output:
-            label = output.split("CLASSIFICATION:")[-1].strip()
+        output = _run_bitnet(job_id, prompt, n_tokens=60)
+
+        if "STATUS:" in output:
+            label = output.split("STATUS:")[-1].strip()
         else:
             label = output.strip()
 
         # Normalize to one of the three expected labels where possible.
-        # Order matters: check "not an fir" / "not a fir" before the
-        # "valid"/"invalid" substring checks, since neither of those
-        # substrings appears in "not an fir".
+        # Order matters: check "not an fir" before the "suspect identified" /
+        # "case open" checks, since a non-FIR document should never fall
+        # through to an investigation-status label.
         label_lower = label.lower()
         if "not an fir" in label_lower or "not a fir" in label_lower:
             normalized = "Not an FIR"
-        elif "invalid" in label_lower:
-            normalized = "Invalid FIR"
-        elif "valid" in label_lower:
-            normalized = "Valid FIR"
+        elif "suspect identified" in label_lower:
+            normalized = "Suspect Identified"
+        elif "case open" in label_lower or "untraced" in label_lower:
+            normalized = "Case Open"
         else:
             normalized = label  # fall back to raw model output
 
-        return {"classification": normalized, "raw_output": label}
+        return {"status": normalized, "raw_output": label}
 
     except HTTPException:
         raise
