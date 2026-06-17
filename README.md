@@ -53,8 +53,6 @@ Surya processes a document through up to 5 sequential deep-learning pipelines. T
 ├── step3/                           ← Layout swap + hybrid pipeline + BitNet AI
 │   ├── pp_layout_backend.py         PP-DocLayoutV3 drop-in for Surya layout
 │   ├── benchmark_hybrid.py          Baseline vs hybrid benchmark
-│   ├── test_ppdoclayout.py          Layout comparison test
-│   ├── SLANet_accuracy.py           SLANet table recognition evaluation
 │   ├── requirements.txt
 │   └── README.md
 │
@@ -66,6 +64,7 @@ Surya processes a document through up to 5 sequential deep-learning pipelines. T
     │   ├── image_cache.py           dHash (perceptual) image cache
     │   ├── layout.py                PP-DocLayoutV3 classifier
     │   └── table_rec.py             RapidTable wrapper
+    │   ├── pp_layout_backend.py         PP-DocLayoutV3 drop-in for Surya layout
     └── frontend/
         └── src/
             └── App.js               React UI with LLM action buttons
