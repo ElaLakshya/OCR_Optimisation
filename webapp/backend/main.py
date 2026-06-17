@@ -283,9 +283,21 @@ def summarize_document(job_id: str):
     try:
         clean_text = _get_clean_document_text(job)
 
-        # 1. THE PROMPT CONSTRAINT: Demand a single paragraph and 3 sentences
-        prompt = f"""You are a helpful assistant that summarizes text. Extract exactly three facts from this document. Fill in the three numbered lines below based on the text.
-CRITICAL RULE: DO NOT invent unproven information or outcomes.
+        # Few-shot prompt: one short worked example anchors the exact format
+        # (3 numbered lines, factual, no invented outcomes) before the real
+        # document is given, which is far more reliable for a small model
+        # than instructions alone.
+        prompt = f"""You are a helpful assistant that summarizes police case documents in exactly 3 numbered lines. Each line is one short factual sentence covering: (1) what was reported, (2) who is involved, (3) the current status of the case. Do not invent information that is not stated in the text.
+
+EXAMPLE DOCUMENT:
+FIR No. 12/2020. Complainant Aman Verma reported that his motorcycle, registration DL05X1234, was stolen from outside his residence on 03.01.2020. Investigation entrusted to SI Priya Sharma. Statements of complainant and one neighbour recorded. No suspect has been identified. Case remains under investigation.
+
+EXAMPLE 3-LINE SUMMARY:
+1. Aman Verma reported his motorcycle stolen from outside his residence on 03.01.2020.
+2. The complainant and a neighbour gave statements; investigation was led by SI Priya Sharma.
+3. No suspect has been identified and the case remains under investigation.
+
+Now summarize the following document the same way.
 
 DOCUMENT TEXT:
 {clean_text}
@@ -296,7 +308,11 @@ DOCUMENT TEXT:
         # We lower the token limit to 100 since 3 lines will never need more than that
         output = _run_bitnet(job_id, prompt, n_tokens=100)
 
-        # 2. BULLETPROOF EXTRACTION: Split safely at the header
+        # 2. BULLETPROOF EXTRACTION: Split safely at the header.
+        # NOTE: the prompt now contains "3-LINE SUMMARY:" twice (once in the
+        # worked example, once for the real document). split(...)[-1] grabs
+        # everything after the LAST occurrence, which is always the real
+        # document's section since it comes after the example in the prompt.
         if "3-LINE SUMMARY:" in output:
             # Take everything AFTER "3-LINE SUMMARY:"
             summary_raw = output.split("3-LINE SUMMARY:")[-1].strip()
@@ -342,14 +358,26 @@ def classify_document(job_id: str):
     try:
         clean_text = _get_clean_document_text(job)
 
-        prompt = f"""You are a helpful assistant reviewing a document. First check whether this document is a police FIR / case diary at all. Then, only if it is, determine the current investigation status based only on what is stated in the text.
+        # Few-shot prompt: one worked example per label anchors the three-way
+        # boundary much more reliably than instructions alone, especially
+        # the "Suspect Identified" vs "Case Open" distinction which hinges
+        # on evidence being explicitly linked to a named person, not just
+        # a suspect being named or questioned.
+        prompt = f"""You are a helpful assistant reviewing a document. First check whether it is a police FIR / case diary at all. If it is, determine the current investigation status based only on what is stated in the text. Respond with exactly one label, followed by a one-sentence reason.
 
-Respond with exactly one of these three labels, followed by a one-sentence reason:
-- "Not an FIR" — the document is not a police FIR or case diary (e.g. it is an unrelated letter, certificate, invoice, or other document type).
-- "Suspect Identified" — the document is an FIR, a specific named individual is identified as a suspect, AND there is stated evidence connecting them to the offense (e.g. confession, forensic match, recovered stolen property, witness identification).
-- "Case Open" — the document is an FIR, but no named suspect is tied to supporting evidence (this includes: no suspect found, suspects were questioned but not linked by evidence, or the case is recorded as untraced/pending).
+EXAMPLE 1
+DOCUMENT TEXT: "Marks Statement cum Certificate. Central Board of Secondary Education. This is to certify that Lakshya Vir Singh Guleria has passed the Secondary School Examination 2022."
+STATUS: Not an FIR — this is an academic marks certificate, not a police case document.
 
-Do not judge whether the complaint itself is genuine or whether it should be filed — only report the document type, and if it is an FIR, what it states about suspect identification and evidence.
+EXAMPLE 2
+DOCUMENT TEXT: "FIR No. 44/2021. Complainant reported a burglary. Suspect Mahesh Kumar was arrested. Stolen jewellery was recovered from his residence and identified by the complainant. Mahesh Kumar confessed during interrogation."
+STATUS: Suspect Identified — a named suspect was arrested, stolen property was recovered from him, and he confessed.
+
+EXAMPLE 3
+DOCUMENT TEXT: "FIR No. 95/2019. Complainant reported theft of two bags from his car. Ten persons were called in for enquiry and questioned individually but no evidence linked any of them to the theft. Case closed as UNTRACED, investigation to continue on a secret basis."
+STATUS: Case Open — multiple people were questioned but no evidence tied any of them to the offense, and the case remains untraced.
+
+Now classify the following document the same way. Respond with exactly one of: "Not an FIR", "Suspect Identified", or "Case Open", followed by a one-sentence reason.
 
 DOCUMENT TEXT:
 {clean_text}
@@ -358,6 +386,10 @@ STATUS:"""
 
         output = _run_bitnet(job_id, prompt, n_tokens=60)
 
+        # NOTE: "STATUS:" now appears 4 times in the prompt (once per
+        # worked example, once for the real document). split(...)[-1]
+        # grabs everything after the LAST occurrence, which is always
+        # the real document's status since it comes after all examples.
         if "STATUS:" in output:
             label = output.split("STATUS:")[-1].strip()
         else:
