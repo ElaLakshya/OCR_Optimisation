@@ -1,22 +1,25 @@
 """
 main.py
-
 FastAPI backend for the OCR webapp.
+Integrated with local BitNet-b1.58-2B-4T CPU Inference for:
+- /summarize/{job_id} — strict 3-line FIR summary
+- /classify/{job_id}  — Valid FIR / Invalid FIR classification
 """
 
 from __future__ import annotations
 
 import os
-from unittest import result
 import uuid
 import threading
 import time
 import shutil
+import subprocess
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from bs4 import BeautifulSoup
 
 from pipeline import OCRPipeline
 
@@ -40,15 +43,22 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # ── Global pipeline instance ──────────────────────────────────────────────────
 _pipeline = OCRPipeline()
 
+# ── BitNet paths ──────────────────────────────────────────────────────────────
+_BITNET_DIR   = Path(r"C:\Users\ElaYTurbo\Desktop\TurboFile\Projects\BitNet")
+_BITNET_BIN   = _BITNET_DIR / "build" / "bin" / "Release"
+_LLAMA_CLI    = _BITNET_BIN / "llama-cli.exe"
+_BITNET_MODEL = _BITNET_DIR / "models" / "BitNet-b1.58-2B-4T" / "ggml-model-i2_s.gguf"
+
+# Safety limit: keeps prompt + generation comfortably under the 2048 context window
+_MAX_DOC_CHARS = 6000
+
 # ── In-memory job store ───────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 
-
 def _update_job(job_id: str, **kwargs):
     with _jobs_lock:
         _jobs[job_id].update(kwargs)
-
 
 def _run_job(job_id: str, file_path: str, file_type: str):
     try:
@@ -66,8 +76,7 @@ def _run_job(job_id: str, file_path: str, file_type: str):
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(result["html"])
 
-        # Convert HTML to PDF using pure-Python xhtml2pdf compiler
-        # Convert HTML to PDF using pure-Python xhtml2pdf compiler
+        # Convert HTML to PDF using pdfkit
         pdf_path = OUTPUT_DIR / f"{job_id}.pdf"
         try:
             import pdfkit
@@ -117,8 +126,58 @@ def _run_job(job_id: str, file_path: str, file_type: str):
         except Exception:
             pass
 
+def _get_clean_document_text(job: dict) -> str:
+    """Strip HTML tags and truncate to a safe length for BitNet's context window."""
+    clean_text = BeautifulSoup(job["html"], "html.parser").get_text(separator="\n", strip=True)
+    if len(clean_text) > _MAX_DOC_CHARS:
+        clean_text = clean_text[:_MAX_DOC_CHARS] + "\n... [DOCUMENT TRUNCATED DUE TO LENGTH LIMIT] ..."
+    return clean_text
 
-# ── Startup: pre-load Surya so first request doesn't pay loading cost ─────────
+def _run_bitnet(job_id: str, prompt: str, n_tokens: int = 400) -> str:
+    """
+    Writes the prompt to a temp file and invokes the compiled BitNet llama-cli
+    binary. Always cleans up the temp file, even on failure.
+    """
+    prompt_file = OUTPUT_DIR / f"{job_id}_prompt.txt"
+    try:
+        with open(prompt_file, "w", encoding="utf-8") as f:
+            f.write(prompt)
+
+        command = [
+            str(_LLAMA_CLI),
+            "-m", str(_BITNET_MODEL),
+            "-f", str(prompt_file),
+            "-n", str(n_tokens),
+            "--temp", "0.1",
+            "-c", "2048",
+            "-b", "128",  # lower batch size avoids CPU segfaults on this hardware
+        ]
+
+        print(f"[BitNet] Triggering native C++ CPU inference from {_BITNET_BIN}...")
+
+        # cwd must be the binary's directory so Windows resolves ggml.dll correctly
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            cwd=str(_BITNET_BIN),
+            check=True,
+        )
+        return result.stdout
+
+    except subprocess.CalledProcessError as e:
+        print("[BitNet] Subprocess error stdout:\n", e.stdout)
+        print("[BitNet] Subprocess error stderr:\n", e.stderr)
+        raise HTTPException(status_code=500, detail="BitNet inference failed during execution.")
+    finally:
+        try:
+            os.remove(prompt_file)
+        except Exception:
+            pass
+
+# ── Startup ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def startup():
     print("[Startup] Pre-loading Surya predictors...")
@@ -127,7 +186,6 @@ def startup():
         print("[Startup] Surya ready.")
     except Exception as e:
         print(f"[Startup] WARNING: Surya pre-load failed: {e}")
-
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -176,7 +234,6 @@ def upload_file(file: UploadFile = File(...)):
 
     return {"job_id": job_id, "filename": filename, "file_type": file_type}
 
-
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
     with _jobs_lock:
@@ -193,7 +250,6 @@ def get_status(job_id: str):
         "error":    job.get("error"),
         "filename": job.get("filename"),
     }
-
 
 @app.get("/result/{job_id}")
 def get_result(job_id: str):
@@ -215,6 +271,105 @@ def get_result(job_id: str):
         "filename": job["filename"],
     }
 
+# ── BitNet: 3-line FIR Summary ───────────────────────────────────────────────
+@app.post("/summarize/{job_id}")
+def summarize_document(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if job is None or job["status"] != "done" or not job.get("html"):
+        raise HTTPException(status_code=400, detail="Job not ready for summarization")
+
+    try:
+        clean_text = _get_clean_document_text(job)
+
+        # 1. THE PROMPT CONSTRAINT: Demand a single paragraph and 3 sentences
+        prompt = f"""You are a helpful assistant that summarizes text. Extract exactly three facts from this document. Fill in the three numbered lines below based on the text.
+CRITICAL RULE: DO NOT invent unproven information or outcomes.
+
+DOCUMENT TEXT:
+{clean_text}
+
+3-LINE SUMMARY:
+1."""
+
+        # We lower the token limit to 100 since 3 lines will never need more than that
+        output = _run_bitnet(job_id, prompt, n_tokens=100)
+
+        # 2. BULLETPROOF EXTRACTION: Split safely at the header
+        if "3-LINE SUMMARY:" in output:
+            # Take everything AFTER "3-LINE SUMMARY:"
+            summary_raw = output.split("3-LINE SUMMARY:")[-1].strip()
+            
+            # Since the prompt ended with "1.", summary_raw will already start with "1."
+            # If for some reason it doesn't, we add it back safely.
+            if not summary_raw.startswith("1."):
+                summary_raw = "1. " + summary_raw
+                
+            summary_text = summary_raw
+        else:
+            summary_text = output.strip()
+
+        # 3. THE PYTHON GUILLOTINE: Strictly enforce 3 lines maximum
+        clean_lines = [line.strip() for line in summary_text.split('\n') if line.strip()]
+        summary_text = '\n'.join(clean_lines[:3])
+
+        return {"summary": summary_text}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print("[BitNet] Unknown error:\n", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── BitNet: FIR Classification ───────────────────────────────────────────────
+@app.post("/classify/{job_id}")
+def classify_document(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if job is None or job["status"] != "done" or not job.get("html"):
+        raise HTTPException(status_code=400, detail="Job not ready for classification")
+
+    try:
+        clean_text = _get_clean_document_text(job)
+
+        prompt = f"""You are a helpful assistant that classifies the text into exactly one of these three categories: "Valid FIR", "Invalid FIR", or "Not an FIR". Respond with only the category name and nothing else.
+
+DOCUMENT TEXT:
+{clean_text}
+CLASSIFICATION:"""
+
+        output = _run_bitnet(job_id, prompt, n_tokens=20)
+
+        if "CLASSIFICATION:" in output:
+            label = output.split("CLASSIFICATION:")[-1].strip()
+        else:
+            label = output.strip()
+
+        # Normalize to one of the three expected labels where possible.
+        # Order matters: check "not an fir" / "not a fir" before the
+        # "valid"/"invalid" substring checks, since neither of those
+        # substrings appears in "not an fir".
+        label_lower = label.lower()
+        if "not an fir" in label_lower or "not a fir" in label_lower:
+            normalized = "Not an FIR"
+        elif "invalid" in label_lower:
+            normalized = "Invalid FIR"
+        elif "valid" in label_lower:
+            normalized = "Valid FIR"
+        else:
+            normalized = label  # fall back to raw model output
+
+        return {"classification": normalized, "raw_output": label}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print("[BitNet] Unknown error:\n", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/download/{job_id}/html")
 def download_html(job_id: str):
@@ -227,7 +382,6 @@ def download_html(job_id: str):
     filename = Path(job["filename"]).stem + "_ocr.html"
     return FileResponse(job["html_path"], media_type="text/html", filename=filename)
 
-
 @app.get("/download/{job_id}/pdf")
 def download_pdf(job_id: str):
     with _jobs_lock:
@@ -238,7 +392,6 @@ def download_pdf(job_id: str):
 
     filename = Path(job["filename"]).stem + "_ocr.pdf"
     return FileResponse(job["pdf_path"], media_type="application/pdf", filename=filename)
-
 
 @app.get("/health")
 def health():

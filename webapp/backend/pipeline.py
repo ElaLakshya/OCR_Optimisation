@@ -7,12 +7,27 @@ Two modes:
     A) PDF  → Docling extracts digital text, garbled blocks sent to Surya OCR,
               tables with garbled headers use Surya TableRecPredictor + Cell OCR
     B) Image → PP-DocLayoutV3 layout + Surya OCR directly
-"""
 
+NOTE: This checkpoint fixes three bugs from the dHash/300-DPI revision:
+    1. image_cache.py now compares dHashes via Hamming distance 
+       so near-identical signature crops actually deduplicate.
+    2. _surya_table_to_html now extracts cell text from BlockOCRResult.html
+       (via BeautifulSoup) instead of a non-existent .text attribute.
+    3. Per-cell table OCR now passes a LayoutBox/LayoutResult per cell so
+       Surya uses fast block-mode instead of slow full-page mode per cell,
+       and all cells are batched into a single _rec_predictor call.
+
+Known NOT fixed here (separate issue): Docling/DocLayNet misclassifying
+form-style header boxes as TABLE on documents like test1.pdf, which
+scrambles reading order. That is a layout-detection issue independent of
+the Hindi-garbled-table problem these fixes target.
+"""
 from __future__ import annotations
+
 import os
 os.environ["RECOGNITION_MAX_PAGES"] = "1"
 os.environ["RECOGNITION_IMAGE_SIZE"] = "896"
+
 import sys
 import time
 import io
@@ -36,9 +51,7 @@ if _SURYA_DIR not in sys.path:
 # ══════════════════════════════════════════════════════════════════════════════
 #  GARBLED TEXT DETECTION — word level
 # ══════════════════════════════════════════════════════════════════════════════
-
 _GARBLED_CHARS = set(";\\/æøåÆØÅçèéêëìíîïðñòóôõöùúûüýþÿ'{}")
-
 
 def _word_is_garbled(word: str) -> bool:
     import re
@@ -48,7 +61,6 @@ def _word_is_garbled(word: str) -> bool:
     if re.search(r'[bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ]{4,}', word):
         return True
     return False
-
 
 def _is_garbled(text: str) -> bool:
     import re
@@ -60,10 +72,9 @@ def _is_garbled(text: str) -> bool:
     return (garbled / len(words)) > 0.1
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  IMAGE REGION PRE-FILTER
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
 def _should_skip_region(image: Image.Image) -> bool:
     w, h = image.size
     if w < 50 or h < 20:
@@ -74,10 +85,9 @@ def _should_skip_region(image: Image.Image) -> bool:
     return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  TABLE HTML VALIDATION
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
 def _table_html_has_content(html: str) -> bool:
     if not html or not html.strip():
         return False
@@ -91,10 +101,9 @@ def _table_html_has_content(html: str) -> bool:
         return bool(html.strip())
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  PIPELINE
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
 class OCRPipeline:
 
     def __init__(self):
@@ -119,7 +128,7 @@ class OCRPipeline:
         print("[Pipeline] Surya predictors loaded.")
 
     def _ocr_crop(self, image: Image.Image) -> str:
-        """Runs Surya OCR on a single image crop using precise block tracking."""
+        """Run Surya OCR on a single image crop using fast block mode."""
         self._load_surya()
         from surya.layout.schema import LayoutBox, LayoutResult
         import torch
@@ -140,7 +149,7 @@ class OCRPipeline:
 
         with torch.inference_mode():
             results = self._rec_predictor([image], [layout])
-            
+
         if not results or not results[0].blocks:
             return ""
 
@@ -151,10 +160,16 @@ class OCRPipeline:
         return "\n".join(html_parts)
 
     def _surya_table_to_html(self, table_result, base_table_img: Image.Image) -> str:
-        """Converts Surya Table layout into HTML while running Surya OCR on cells to fix Hindi text."""
+        """
+        Convert Surya TableRecPredictor cell layout into HTML, running Surya
+        OCR on each cell crop to recover correct Hindi/Devanagari text that
+        Docling's native export got from a garbled font encoding.
+        """
         self._load_surya()
         import torch
-        
+        from bs4 import BeautifulSoup
+        from surya.layout.schema import LayoutBox, LayoutResult
+
         cells = getattr(table_result, 'cells', [])
         if not cells:
             return ""
@@ -162,32 +177,59 @@ class OCRPipeline:
         max_row = max((getattr(c, 'row_id', 0) for c in cells), default=0)
         max_col = max((getattr(c, 'col_id', 0) for c in cells), default=0)
 
-        # Batch harvest cell image crops for swift sequential processing
-        cell_crops = []
-        cell_coords = []
+        cell_crops   = []
+        cell_layouts = []
+        cell_coords  = []
+
         for cell in cells:
             r = getattr(cell, 'row_id', 0)
             c = getattr(cell, 'col_id', 0)
             x0, y0, x1, y1 = [int(v) for v in cell.bbox]
-            
-            # Add micro-padding to preserve Hindi vowel modifiers (matras)
-            pad = 2
+
+            # Padding preserves Hindi matras at cell edges
+            pad = 6
             cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad)
-            cx1, cy1 = min(base_table_img.width, x1 + pad), min(base_table_img.height, y1 + pad)
-            
+            cx1 = min(base_table_img.width,  x1 + pad)
+            cy1 = min(base_table_img.height, y1 + pad)
+            if cx1 <= cx0 or cy1 <= cy0:
+                continue
+
             crop = base_table_img.crop((cx0, cy0, cx1, cy1))
+            cw, ch = crop.size
+
+            box = LayoutBox(
+                polygon=[0, 0, cw, ch],
+                label="Text",
+                raw_label="text",
+                position=0,
+                confidence=1.0,
+                count=150,  # small cells — modest token budget is plenty
+            )
+            layout = LayoutResult(
+                bboxes=[box],
+                image_bbox=[0.0, 0.0, float(cw), float(ch)],
+            )
+
             cell_crops.append(crop)
+            cell_layouts.append(layout)
             cell_coords.append((r, c))
 
         grid = {}
         if cell_crops:
             with torch.inference_mode():
-                # Perform layout tracking OCR to resolve garbled text states natively
-                rec_results = self._rec_predictor(cell_crops)
-                for idx, res in enumerate(rec_results):
-                    r, c = cell_coords[idx]
-                    text_parts = [b.text for b in res.blocks if hasattr(b, 'text')] if res.blocks else []
-                    grid[(r, c)] = " ".join(text_parts).strip()
+                # Single batched call across all cells, each using block mode
+                rec_results = self._rec_predictor(cell_crops, cell_layouts)
+
+            for idx, res in enumerate(rec_results):
+                r, c = cell_coords[idx]
+                text_parts = []
+                if res and res.blocks:
+                    for b in sorted(res.blocks, key=lambda x: x.reading_order):
+                        if not b.skipped and not b.error and b.html.strip():
+                            text_parts.append(
+                                BeautifulSoup(b.html, "html.parser").get_text(strip=True)
+                            )
+                grid[(r, c)] = " ".join(text_parts).strip()
 
         rows = []
         for r in range(max_row + 1):
@@ -200,23 +242,29 @@ class OCRPipeline:
 
         return f'<table>{"".join(rows)}</table>'
 
-    def _crop_pdf_region(self, page_obj, x0, y0, x1, y1, dpi=150, padding=6):
+    def _crop_pdf_region(self, page_obj, x0, y0, x1, y1, dpi=300, padding=12):
+        """
+        Crop a region from a PDF page as PIL Image at 300 DPI for high-accuracy OCR.
+        padding (in points) avoids cutting off matras/diacritics at edges.
+        """
         import fitz
         pw = page_obj.rect.width
         ph = page_obj.rect.height
-        cx0 = max(0, x0 - padding * 72 / dpi)
-        cy0 = max(0, y0 - padding * 72 / dpi)
-        cx1 = min(pw, x1 + padding * 72 / dpi)
-        cy1 = min(ph, y1 + padding * 72 / dpi)
+
+        pad_pts = padding * 72 / dpi
+        cx0 = max(0, x0 - pad_pts)
+        cy0 = max(0, y0 - pad_pts)
+        cx1 = min(pw, x1 + pad_pts)
+        cy1 = min(ph, y1 + pad_pts)
 
         mat  = fitz.Matrix(dpi / 72, dpi / 72)
         clip = fitz.Rect(cx0, cy0, cx1, cy1)
         pix  = page_obj.get_pixmap(matrix=mat, clip=clip)
         return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
     #  PDF PIPELINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
 
     def process_pdf(self, pdf_path: str, progress_callback=None) -> dict:
         cache       = ImageCache()
@@ -303,8 +351,12 @@ class OCRPipeline:
                 # ── Table ─────────────────────────────────────────────────────
                 elif label == DocItemLabel.TABLE:
                     try:
-                        # FIXED: Removed wrong parameter call that crashed layout conversions
-                        tbl_html = item.export_to_html()
+                        tbl_html = item.export_to_html(doc)
+                    except TypeError:
+                        try:
+                            tbl_html = item.export_to_html()
+                        except Exception:
+                            tbl_html = ""
                     except Exception:
                         tbl_html = ""
 
@@ -326,7 +378,6 @@ class OCRPipeline:
                             with torch.inference_mode():
                                 tab_results = self._surya_tab_predictor([img])
                             if tab_results and getattr(tab_results[0], 'cells', []):
-                                # FIXED: Passed structural frame references to enable inner content extraction
                                 tbl_html = self._surya_table_to_html(tab_results[0], img)
                         except Exception as e:
                             print(f"[Pipeline] Surya TableRecPredictor failed: {e}")
@@ -336,7 +387,21 @@ class OCRPipeline:
                         "position": pos, "content": tbl_html,
                     })
 
-                # ── Text ──────────────────────────────────────────────────────
+                # ── List items ────────────────────────────────────────────────
+                elif label == DocItemLabel.LIST_ITEM:
+                    raw_text = ""
+                    if hasattr(item, 'orig') and item.orig:
+                        raw_text = item.orig
+                    elif hasattr(item, 'text') and item.text:
+                        raw_text = item.text
+
+                    html = f"<ul><li>{raw_text}</li></ul>"
+                    page_blocks[page_no].append({
+                        "type": "list", "page": page_no, "bbox": bbox,
+                        "position": pos, "content": html,
+                    })
+
+                # ── Text → check garbled, route accordingly ───────────────────
                 else:
                     raw_text = ""
                     if hasattr(item, 'orig') and item.orig:
@@ -391,18 +456,21 @@ class OCRPipeline:
 
                 img = block["image"]
 
+                # Cache check (dHash + Hamming distance)
                 cached = cache.get(img)
                 if cached is not None:
                     stats["cache_hits"] += 1
                     block["content"] = "" if cache.is_skip(cached) else cached
                     continue
 
+                # Pre-filter: QR codes, tiny icons
                 if _should_skip_region(img):
                     cache.mark_skip(img)
                     block["content"] = ""
                     print(f"[Pipeline] Pre-filtered: size={img.size}")
                     continue
 
+                # Classify with PP-DocLayoutV3
                 label = self._layout_classifier.classify(img)
                 print(f"[Pipeline] Classified: size={img.size} → {label}")
 
@@ -418,11 +486,11 @@ class OCRPipeline:
                     images_to_ocr.append(img)
                     stats["cache_misses"] += 1
 
+        # OCR each non-cached, non-skipped image region using fast block mode
         if images_to_ocr:
             self._load_surya()
             print(f"[Pipeline] OCR on {len(images_to_ocr)} image region(s)...")
 
-            import torch
             import gc
             gc.collect()
 
@@ -451,15 +519,12 @@ class OCRPipeline:
         _progress("Rendering output", 90)
         html = _render_html(pages)
         _progress("Done", 100)
-        stats["total"] = round(time.time() - total_start, 2)
-        stats["n_pages"] = n_pages
-        stats["n_image_regions"] = n_images if 'n_images' in locals() else 0
 
         return {"html": html, "pages": pages, "stats": stats}
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
     #  IMAGE PIPELINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
 
     def process_image(self, image_path: str, progress_callback=None) -> dict:
         stats       = {"stages": {}, "cache_hits": 0, "cache_misses": 0}
@@ -511,7 +576,7 @@ class OCRPipeline:
         _progress("Running OCR", 50)
         t0 = time.time()
         self._load_surya()
-        
+
         import torch
         with torch.inference_mode():
             rec_results = self._rec_predictor([image], lay_results)
@@ -540,48 +605,82 @@ class OCRPipeline:
         return {"html": html, "pages": pages, "stats": stats}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  HTML RENDERER
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML RENDERER
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML RENDERER
+# ══════════════════════════════════════════════════════════════════════════════
 def _render_html(pages: list) -> str:
-    html_parts = ["""<!DOCTYPE html>
+    html_parts = ["""
+<!DOCTYPE html>
 <html lang="hi">
 <head>
 <meta charset="UTF-8">
 <style>
-  
-  body { 
-    font-family: 'Mangal', Arial, sans-serif; 
-    max-width: 800px; 
-    margin: 0 auto; 
-    line-height: 1.6; 
+  body {
+    font-family: 'Mangal', Arial, sans-serif;
+    max-width: 900px;
+    margin: 0 auto;
+    line-height: 1.5;
     font-size: 11pt;
     color: #222222;
   }
-  .page { page-break-after: always; }
+  
+  /* FIX 2: Let wkhtmltopdf paginate naturally to stop blank overflow pages */
+  .page { margin-bottom: 30px; }
+  
   .page-header { font-size: 9pt; color: #888888; margin-bottom: 10px; border-bottom: 1px solid #e5e5e5; padding-bottom: 4px; }
-  .text-block { margin-bottom: 12px; text-align: justify; }
-  .table-block { margin-bottom: 15px; width: 100%; }
-  table { width: 100%; border-collapse: collapse; font-size: 10pt; margin-top: 5px; }
-  td, th { border: 1px solid #666666; padding: 6px; text-align: left; }
+  
+  /* FIX 1: Left align text to stop weird justified white-spaces */
+  .text-block { margin-bottom: 10px; text-align: left; }
+  
+  .table-block { margin-top: 15px; margin-bottom: 20px; width: 100%; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 10pt;
+    table-layout: auto;
+  }
+  td, th {
+    border: 1px solid #666666;
+    padding: 6px 8px;
+    text-align: left;
+    vertical-align: top;
+    word-break: break-word;
+  }
   th { background-color: #f2f2f2; font-weight: bold; }
+  
+  /* FIX 3: Remove default black dots & add a hanging indent for alignment */
+  ul, ol { 
+    margin: 4px 0; 
+    padding-left: 20px; 
+    list-style-type: none; 
+  }
+  li { 
+    margin-bottom: 6px; 
+    text-indent: -18px; /* Pulls the '1.' or 'i.' to the left */
+    padding-left: 18px; /* Pushes the subsequent lines to the right */
+  }
 </style>
 </head>
 <body>
 """]
-
     for page in pages:
         html_parts.append(f'<div class="page"><div class="page-header">Page {page["page"]}</div>')
         for block in page["blocks"]:
             content = block.get("content") or ""
             if not content.strip():
                 continue
-            # Skip Docling hallucinated picture descriptions
+
+            # Skip Docling hallucinated picture descriptions (img with no src)
             if '<img' in content and 'src=' not in content:
                 continue
+
             if block["type"] == "table":
                 html_parts.append(f'<div class="table-block">{content}</div>')
+            elif block["type"] == "list":
+                html_parts.append(f'<div>{content}</div>')
             else:
                 html_parts.append(f'<div class="text-block">{content}</div>')
         html_parts.append('</div>')

@@ -1,0 +1,16 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+docling==2.9.0
+docling-core==2.4.0
+onnxruntime==1.16.3
+opencv-python==4.8.1.78
+numpy==1.26.2
+Pillow==10.1.0
+beautifulsoup4==4.12.2
+PyMuPDF==1.23.6
+rapid-table==0.2.1
+pdfkit==1.0.0
+surya-ocr==0.4.14
+ImageHash==4.3.1
+scipy==1.11.4
