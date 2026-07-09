@@ -14,9 +14,10 @@ import threading
 import time
 import shutil
 import subprocess
+import re
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from bs4 import BeautifulSoup
@@ -60,7 +61,7 @@ def _update_job(job_id: str, **kwargs):
     with _jobs_lock:
         _jobs[job_id].update(kwargs)
 
-def _run_job(job_id: str, file_path: str, file_type: str):
+def _run_job(job_id: str, file_path: str, file_type: str, mode: str):
     try:
         _update_job(job_id, status="running", stage="Starting", progress=0)
 
@@ -68,7 +69,12 @@ def _run_job(job_id: str, file_path: str, file_type: str):
             _update_job(job_id, stage=stage, progress=pct)
 
         if file_type == "pdf":
-            result = _pipeline.process_pdf(file_path, progress_callback)
+            if mode == "force_image":
+                print("[Main] Mode: force_image. Bypassing Docling, rendering PDF to images.")
+                result = _pipeline.process_pdf_as_images(file_path, progress_callback)
+            else:
+                print("[Main] Mode: auto. Using Docling for digital PDF extraction.")
+                result = _pipeline.process_pdf(file_path, progress_callback)
         else:
             result = _pipeline.process_image(file_path, progress_callback)
 
@@ -190,7 +196,7 @@ def startup():
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.post("/upload")
-def upload_file(file: UploadFile = File(...)):
+def upload_file(file: UploadFile = File(...), mode: str = Form("auto")):
     filename  = file.filename or ""
     extension = Path(filename).suffix.lower()
 
@@ -223,16 +229,17 @@ def upload_file(file: UploadFile = File(...)):
             "created_at": time.time(),
             "filename":   filename,
             "file_type":  file_type,
+            "mode":       mode,
         }
 
     thread = threading.Thread(
         target=_run_job,
-        args=(job_id, save_path, file_type),
+        args=(job_id, save_path, file_type, mode),
         daemon=True,
     )
     thread.start()
 
-    return {"job_id": job_id, "filename": filename, "file_type": file_type}
+    return {"job_id": job_id, "filename": filename, "file_type": file_type, "mode": mode}
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
@@ -283,10 +290,6 @@ def summarize_document(job_id: str):
     try:
         clean_text = _get_clean_document_text(job)
 
-        # Few-shot prompt: one short worked example anchors the exact format
-        # (3 numbered lines, factual, no invented outcomes) before the real
-        # document is given, which is far more reliable for a small model
-        # than instructions alone.
         prompt = f"""You are a helpful assistant that summarizes police case documents in exactly 3 numbered lines. Each line is one short factual sentence covering: (1) what was reported, (2) who is involved, (3) the current status of the case. Do not invent information that is not stated in the text.
 
 EXAMPLE DOCUMENT:
@@ -305,30 +308,21 @@ DOCUMENT TEXT:
 3-LINE SUMMARY:
 1."""
 
-        # We lower the token limit to 100 since 3 lines will never need more than that
         output = _run_bitnet(job_id, prompt, n_tokens=100)
 
-        # 2. BULLETPROOF EXTRACTION: Split safely at the header.
-        # NOTE: the prompt now contains "3-LINE SUMMARY:" twice (once in the
-        # worked example, once for the real document). split(...)[-1] grabs
-        # everything after the LAST occurrence, which is always the real
-        # document's section since it comes after the example in the prompt.
         if "3-LINE SUMMARY:" in output:
-            # Take everything AFTER "3-LINE SUMMARY:"
             summary_raw = output.split("3-LINE SUMMARY:")[-1].strip()
-            
-            # Since the prompt ended with "1.", summary_raw will already start with "1."
-            # If for some reason it doesn't, we add it back safely.
             if not summary_raw.startswith("1."):
                 summary_raw = "1. " + summary_raw
-                
             summary_text = summary_raw
         else:
             summary_text = output.strip()
 
-        # 3. THE PYTHON GUILLOTINE: Strictly enforce 3 lines maximum
         clean_lines = [line.strip() for line in summary_text.split('\n') if line.strip()]
         summary_text = '\n'.join(clean_lines[:3])
+
+        # Save the summary to the job dictionary so the classify endpoint can reuse it!
+        _update_job(job_id, summary=summary_text)
 
         return {"summary": summary_text}
 
@@ -340,13 +334,6 @@ DOCUMENT TEXT:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── BitNet: Document Type + Investigation Status Classification ──────────────
-# NOTE: "Not an FIR" is a document-type check (is this even a police case
-# document at all). "Suspect Identified" / "Case Open" report investigation
-# status for documents that ARE FIRs — NOT a judgment on whether the
-# underlying complaint is legitimate. An "open/untraced" result is a normal,
-# common outcome for genuine crimes and does not mean the FIR was fake,
-# rejected, or without merit — it only reflects whether the document
-# currently shows a named suspect tied to supporting evidence.
 @app.post("/classify/{job_id}")
 def classify_document(job_id: str):
     with _jobs_lock:
@@ -356,18 +343,21 @@ def classify_document(job_id: str):
         raise HTTPException(status_code=400, detail="Job not ready for classification")
 
     try:
-        clean_text = _get_clean_document_text(job)
+        # Use the summary if it was already generated to save tokens and speed up inference!
+        if job.get("summary"):
+            text_to_analyze = "DOCUMENT SUMMARY:\n" + job["summary"]
+        else:
+            # Fallback to truncated text if the user clicked Classify first
+            clean_text = _get_clean_document_text(job)
+            if len(clean_text) > 3500:
+                clean_text = clean_text[:3500] + "\n... [DOCUMENT TRUNCATED] ..."
+            text_to_analyze = "DOCUMENT TEXT:\n" + clean_text
 
-        # Few-shot prompt: one worked example per label anchors the three-way
-        # boundary much more reliably than instructions alone, especially
-        # the "Suspect Identified" vs "Case Open" distinction which hinges
-        # on evidence being explicitly linked to a named person, not just
-        # a suspect being named or questioned.
         prompt = f"""You are a helpful assistant reviewing a document. First check whether it is a police FIR / case diary at all. If it is, determine the current investigation status based only on what is stated in the text. Respond with exactly one label, followed by a one-sentence reason.
 
 EXAMPLE 1
 DOCUMENT TEXT: "Marks Statement cum Certificate. Central Board of Secondary Education. This is to certify that Lakshya Vir Singh Guleria has passed the Secondary School Examination 2022."
-STATUS: Not an FIR — this is an academic marks certificate, not a police case document.
+STATUS: FIR cannot work in court — this is an academic marks certificate, not a police case document.
 
 EXAMPLE 2
 DOCUMENT TEXT: "FIR No. 44/2021. Complainant reported a burglary. Suspect Mahesh Kumar was arrested. Stolen jewellery was recovered from his residence and identified by the complainant. Mahesh Kumar confessed during interrogation."
@@ -377,39 +367,31 @@ EXAMPLE 3
 DOCUMENT TEXT: "FIR No. 95/2019. Complainant reported theft of two bags from his car. Ten persons were called in for enquiry and questioned individually but no evidence linked any of them to the theft. Case closed as UNTRACED, investigation to continue on a secret basis."
 STATUS: Case Open — multiple people were questioned but no evidence tied any of them to the offense, and the case remains untraced.
 
-Now classify the following document the same way. Respond with exactly one of: "Not an FIR", "Suspect Identified", or "Case Open", followed by a one-sentence reason.
+Now classify the following document the same way. Respond with exactly one of: "FIR cannot work in court", "Suspect Identified", or "Case Open", followed by a one-sentence reason.
 
-DOCUMENT TEXT:
-{clean_text}
+{text_to_analyze}
 
 STATUS:"""
 
         output = _run_bitnet(job_id, prompt, n_tokens=60)
 
-        # NOTE: "STATUS:" now appears 4 times in the prompt (once per
-        # worked example, once for the real document). split(...)[-1]
-        # grabs everything after the LAST occurrence, which is always
-        # the real document's status since it comes after all examples.
         if "STATUS:" in output:
             label = output.split("STATUS:")[-1].strip()
         else:
             label = output.strip()
 
-        # Normalize to one of the three expected labels where possible.
-        # Order matters: check "not an fir" before the "suspect identified" /
-        # "case open" checks, since a non-FIR document should never fall
-        # through to an investigation-status label.
         label_lower = label.lower()
-        if "not an fir" in label_lower or "not a fir" in label_lower:
-            normalized = "Not an FIR"
+        if "fir cannot work in court" in label_lower or "not an fir" in label_lower or "not a fir" in label_lower:
+            normalized = "FIR cannot work in court"
         elif "suspect identified" in label_lower:
             normalized = "Suspect Identified"
         elif "case open" in label_lower or "untraced" in label_lower:
             normalized = "Case Open"
         else:
-            normalized = label  # fall back to raw model output
+            normalized = label  
 
-        return {"status": normalized, "raw_output": label}
+        # FIX: Ensure we return the dictionary key as "classification" so the frontend matches it
+        return {"classification": normalized, "raw_output": label}
 
     except HTTPException:
         raise
